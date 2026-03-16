@@ -1,0 +1,659 @@
+# ============================================================================
+# HR API - OpenAPI Specification
+# קובץ Swagger עם חולשות מכוונות ברמת התיעוד
+# סרקו עם Checkmarx One API Security ובדקו מה נמצא
+# ============================================================================
+#
+# TRAINING NOTES:
+#
+# 🔴 ZOMBIE APIs = endpoints marked deprecated but still active in code.
+#    They appear in this spec as deprecated:true. In reality they still
+#    respond. They haven't been patched or maintained since v2 launched.
+#
+# 🔍 SHADOW APIs = endpoints that EXIST in the code (HrApi.cs) but are
+#    MISSING from this spec entirely. The whole point is the gap between
+#    what's documented and what's deployed. Compare this file to the code.
+#    Missing from this spec:
+#      - GET  /api/debug/health        (diagnostics, env vars)
+#      - POST /api/admin/impersonate   (user impersonation)
+#      - POST /api/admin/query         (raw SQL execution!)
+#      - GET  /api/config              (secrets dump)
+#    Checkmarx API Security discovers these by comparing spec vs traffic.
+#
+# ============================================================================
+
+openapi: "3.0.3"
+
+info:
+  title: HR Management System API
+  description: Internal HR system for managing employees, payroll, and documents.
+  version: "2.1.0"
+  # VULN: contact reveals internal infrastructure details
+  contact:
+    name: Backend Team
+    email: backend-team@internal.company.com
+    url: http://jira.internal.company.com/projects/HRAPI
+
+# ============================================================================
+# VULN: servers block exposes internal infrastructure
+# An attacker who finds this file gets a map of all environments
+# ============================================================================
+servers:
+  - url: https://api.company.com/hr
+    description: Production
+  - url: https://staging-api.company.com/hr
+    description: Staging
+  # VULN: internal Kubernetes service URL exposed
+  - url: http://hr-service.default.svc.cluster.local:8080
+    description: GKE internal
+  # VULN: internal IP exposed
+  - url: http://10.128.0.15:8080
+    description: Legacy VM
+  # VULN: dev server with no auth mentioned explicitly
+  - url: http://dev-hr.internal:3000
+    description: Development - no authentication
+
+# ============================================================================
+# VULN: No global security requirement
+# Each endpoint must define its own - most "forget" to do so
+# ============================================================================
+security: []
+
+components:
+
+  # ==========================================================================
+  # VULN: Security schemes are weak
+  # ==========================================================================
+  securitySchemes:
+    BasicAuth:
+      type: http
+      scheme: basic
+      # VULN: Basic Auth sends credentials in base64 (not encrypted)
+
+    ApiKeyQuery:
+      type: apiKey
+      in: query
+      name: api_key
+      # VULN: API key in query string = logged in server logs,
+      # browser history, proxy logs, CDN logs
+
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  # ==========================================================================
+  # SCHEMAS
+  # ==========================================================================
+  schemas:
+
+    Employee:
+      type: object
+      properties:
+        id:
+          type: integer
+        firstName:
+          type: string
+        lastName:
+          type: string
+        email:
+          type: string
+          format: email
+        # VULN: PII fields in base schema - every GET returns these
+        password:
+          type: string
+          description: "User password"
+          # VULN: password returned in API responses
+        ssn:
+          type: string
+          description: "Social Security Number"
+          example: "123-45-6789"
+          # VULN: realistic PII example value
+        role:
+          type: string
+          enum: [employee, manager, hr_admin, system_admin]
+        salary:
+          type: number
+          format: double
+          example: 85000
+        bankAccount:
+          type: string
+          description: "Bank account for direct deposit"
+          example: "9876543210"
+          # VULN: realistic financial example
+        department:
+          type: string
+        isActive:
+          type: boolean
+        managerNotes:
+          type: string
+          description: "Confidential notes from manager"
+          # VULN: internal-only field exposed in schema
+
+    EmployeeCreate:
+      type: object
+      required:
+        - firstName
+        - lastName
+        - email
+      properties:
+        firstName:
+          type: string
+          # VULN: no minLength, maxLength, or pattern defined
+        lastName:
+          type: string
+        email:
+          type: string
+        password:
+          type: string
+          example: "password123"
+          # VULN: weak example password, no complexity requirements
+        role:
+          type: string
+          enum: [employee, manager, hr_admin, system_admin]
+          # VULN: client can set their own role - mass assignment
+        salary:
+          type: number
+          # VULN: client can set own salary, no min/max bounds
+        ssn:
+          type: string
+        bankAccount:
+          type: string
+
+    SalaryUpdate:
+      type: object
+      properties:
+        newSalary:
+          type: number
+          # VULN: no minimum or maximum value
+        approvedBy:
+          type: string
+          # VULN: client specifies who approved the change
+        effectiveDate:
+          type: string
+          format: date
+
+    LoginRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: "Authentication token"
+          example: "eyJ1c2VyIjoiYWRtaW4iLCJyb2xlIjoic3lzX2FkbWluIn0="
+          # VULN: example token is decodable base64:
+          # {"user":"admin","role":"sys_admin"}
+        message:
+          type: string
+
+    ImportPhotoRequest:
+      type: object
+      properties:
+        employeeId:
+          type: integer
+        photoUrl:
+          type: string
+          format: uri
+          description: "URL to fetch the photo from"
+          example: "http://example.com/photo.jpg"
+          # VULN: no URL validation or allowlist documented
+
+    # VULN: Error schema exposes internal details
+    Error:
+      type: object
+      properties:
+        message:
+          type: string
+        stackTrace:
+          type: string
+          description: "Full .NET stack trace"
+          # VULN: stack trace in production error responses
+        query:
+          type: string
+          description: "The SQL query that failed"
+          # VULN: SQL query exposed in error response
+
+# ============================================================================
+# PATHS
+# ============================================================================
+paths:
+
+  # ==========================================================================
+  # AUTH
+  # ==========================================================================
+
+  /api/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Login and receive token
+      operationId: login
+      # VULN: no rate limiting documented - brute force possible
+      # VULN: no security on login endpoint (expected), but also no
+      #        mention of lockout policy, MFA, or token expiration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Invalid password for this account"
+                    # VULN: error message reveals that the account exists
+
+  # --------------------------------------------------------------------------
+  # 🔴 ZOMBIE: v1 login - deprecated but still works
+  # --------------------------------------------------------------------------
+  /api/v1/auth/login:
+    post:
+      tags: [ZOMBIE - v1 Deprecated]
+      summary: "[DEPRECATED] Legacy login - DO NOT USE"
+      operationId: loginV1
+      deprecated: true
+      description: |
+        ⚠️ ZOMBIE API: Deprecated since v2 launch but never removed from code.
+        Uses MD5 password comparison. Returns a base64 token with no signature,
+        no expiration, and hardcoded admin:true. Still responds to requests.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Returns unsigned token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+
+  # ==========================================================================
+  # EMPLOYEES CRUD
+  # ==========================================================================
+
+  /api/employees:
+    get:
+      tags: [Employees]
+      summary: List all employees
+      operationId: listEmployees
+      # VULN: NO security defined - completely public
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 5000
+            # VULN: default 5000, no maximum documented
+      responses:
+        "200":
+          description: List of employees
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Employee"
+                  # VULN: full Employee schema with PII
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      tags: [Employees]
+      summary: Create new employee
+      operationId: createEmployee
+      # VULN: no security on creation endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmployeeCreate"
+              # VULN: accepts Role and Salary from client
+      responses:
+        "201":
+          description: Employee created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+
+  /api/employees/{id}:
+    get:
+      tags: [Employees]
+      summary: Get employee by ID
+      operationId: getEmployee
+      # VULN: uses Basic Auth only (weakest scheme)
+      security:
+        - BasicAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            # VULN: no minimum value constraint
+      responses:
+        "200":
+          description: Employee details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Employee 42 not found in department DB"
+                    # VULN: reveals internal info in 404
+
+    put:
+      tags: [Employees]
+      summary: Update employee
+      operationId: updateEmployee
+      # VULN: no security on update
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmployeeCreate"
+      responses:
+        "200":
+          description: Employee updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+
+    delete:
+      tags: [Employees]
+      summary: Delete employee record
+      operationId: deleteEmployee
+      # VULN: no security on delete - anyone can delete any employee
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  # ==========================================================================
+  # SEARCH - SQL Injection risk
+  # ==========================================================================
+
+  /api/employees/search:
+    get:
+      tags: [Employees]
+      summary: Search employees
+      operationId: searchEmployees
+      # VULN: no security
+      parameters:
+        - name: q
+          in: query
+          description: "Free text search"
+          schema:
+            type: string
+            # VULN: no input sanitization documented, feeds into SQL
+        - name: fields
+          in: query
+          description: "Comma-separated field names to return"
+          schema:
+            type: string
+            example: "id,firstName,lastName,email,ssn,salary,password"
+            # VULN: example shows how to request sensitive fields
+            # VULN: the field selection feeds directly into SQL SELECT
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+                  # VULN: additionalProperties:true = any field can appear
+
+  # ==========================================================================
+  # SALARY
+  # ==========================================================================
+
+  /api/employees/{employeeId}/salary:
+    put:
+      tags: [Payroll]
+      summary: Update employee salary
+      operationId: updateSalary
+      # VULN: API key in query param for financial operation
+      security:
+        - ApiKeyQuery: []
+      parameters:
+        - name: employeeId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SalaryUpdate"
+      responses:
+        "200":
+          description: Salary updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  employeeId:
+                    type: integer
+                  previousSalary:
+                    type: number
+                    # VULN: leaks previous salary in response
+                  newSalary:
+                    type: number
+                  approvedBy:
+                    type: string
+
+  /api/reports/payroll:
+    get:
+      tags: [Reports]
+      summary: Generate payroll report
+      operationId: payrollReport
+      security:
+        - BasicAuth: []
+      parameters:
+        - name: department
+          in: query
+          schema:
+            type: string
+        - name: includeSSN
+          in: query
+          schema:
+            type: boolean
+            default: true
+            # VULN: SSN included by default
+        - name: includeBankInfo
+          in: query
+          schema:
+            type: boolean
+            default: true
+            # VULN: bank info included by default
+      responses:
+        "200":
+          description: Full payroll data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Employee"
+
+  # ==========================================================================
+  # DOCUMENTS - file upload
+  # ==========================================================================
+
+  /api/employees/{employeeId}/documents:
+    post:
+      tags: [Documents]
+      summary: Upload employee document
+      operationId: uploadDocument
+      # VULN: no security on file upload
+      parameters:
+        - name: employeeId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  # VULN: no file type restriction
+                  # VULN: no file size limit
+      responses:
+        "200":
+          description: Upload successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  fileUrl:
+                    type: string
+                    example: "https://storage.company.com/docs/emp_123/resume.pdf"
+                  filePath:
+                    type: string
+                    example: "/var/www/uploads/employees/123/resume.pdf"
+                    # VULN: internal server file path exposed
+
+  # ==========================================================================
+  # IMPORT PHOTO - SSRF
+  # ==========================================================================
+
+  /api/employees/import-photo:
+    post:
+      tags: [Employees]
+      summary: Import employee photo from URL
+      operationId: importPhoto
+      # VULN: no security
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportPhotoRequest"
+              # VULN: accepts arbitrary URLs - SSRF
+      responses:
+        "200":
+          description: Photo imported
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+
+  # --------------------------------------------------------------------------
+  # 🔴 ZOMBIE: v1 bulk export - deprecated but never removed
+  # --------------------------------------------------------------------------
+  /api/v1/employees/export:
+    get:
+      tags: [ZOMBIE - v1 Deprecated]
+      summary: "[DEPRECATED] Bulk export all employee data"
+      operationId: exportV1
+      deprecated: true
+      description: |
+        ⚠️ ZOMBIE API: Was supposed to be removed when v2 launched.
+        Still works. No auth. Returns CSV with ALL fields including
+        plaintext passwords, SSNs, and bank account numbers.
+        Was also deployed to Cloud Run during cloud migration.
+      # VULN: no security whatsoever on bulk PII export
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [csv, json, xml]
+            default: csv
+      responses:
+        "200":
+          description: Full employee export
+          content:
+            text/csv:
+              schema:
+                type: string
+
+  # ==========================================================================
+  # 🔍 SHADOW APIs - these exist in HrApi.cs but are NOT listed here:
+  #
+  #   GET  /api/debug/health          → system diagnostics + env vars
+  #   POST /api/admin/impersonate/{id}→ get token as any user
+  #   POST /api/admin/query           → execute raw SQL (!)
+  #   GET  /api/config                → full secrets dump
+  #
+  # The gap between this spec and the actual code IS the vulnerability.
+  # Checkmarx API Security detects this by comparing spec to traffic.
+  # ==========================================================================
